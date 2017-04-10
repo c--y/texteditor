@@ -4,12 +4,29 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <termios.h>
+
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
 
 #define VERSION "0.0.1"
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define AppendBuffer_INIT {NULL, 0}
+
+enum EditorKey {
+    ARROW_LEFT = 1000,
+    ARROW_RIGHT,
+    ARROW_UP,
+    ARROW_DOWN,
+    PAGE_UP,
+    PAGE_DOWN,
+    HOME_KEY,
+    END_KEY,
+    DEL_KEY
+};
 
 typedef struct AppendBuffer {
     char *b;
@@ -28,12 +45,20 @@ void AppendBuffer_free(AppendBuffer *ab) {
     free(ab->b);
 }
 
+typedef struct Row {
+    int size;
+    char *buf;
+} Row;
+
 typedef struct EditorConfig {
     struct termios orig_termios;
     int screen_rows;
     int screen_cols;
     int cx;
     int cy;
+    int row_off;
+    int num_rows;
+    Row *row;
 } EditorConfig;
 
 EditorConfig E;
@@ -71,7 +96,7 @@ void enable_raw_mode() {
     }
 }
 
-char editor_read_key() {
+int editor_read_key() {
     int nread;
     char c;
     while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
@@ -79,7 +104,48 @@ char editor_read_key() {
             die("read");
         }
     }
-    return c;
+
+    if (c == '\x1b') {
+        char seq[3];
+        if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+        if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+
+        if (seq[0] == '[') {
+            // Page up && down
+            if (seq[1] > '0' && seq[1] < '9') {
+                if (read(STDOUT_FILENO, &seq[2], 1) != 1) return '\x1b';
+                if (seq[2] == '~') {
+                    switch (seq[1]) {
+                        case '1': return HOME_KEY;
+                        case '3': return DEL_KEY;
+                        case '4': return END_KEY;
+                        case '5': return PAGE_UP;
+                        case '6': return PAGE_DOWN;
+                        case '7': return HOME_KEY;
+                        case '8': return END_KEY;
+                    }
+                }
+            }
+
+            // Arrow keys
+            switch (seq[1]) {
+                case 'A': return ARROW_UP;
+                case 'B': return ARROW_DOWN;
+                case 'C': return ARROW_RIGHT;
+                case 'D': return ARROW_LEFT;
+                case 'H': return HOME_KEY;
+                case 'F': return END_KEY;
+            }    
+        } else if (seq[0] == 'O') {
+            switch (seq[1]) {
+                case 'H': return HOME_KEY;
+                case 'F': return END_KEY;
+            }
+        }
+        return '\x1b';
+    } else {
+        return c;
+    }
 }
 
 int get_cursor_pos(int *rows, int *cols) {
@@ -122,33 +188,53 @@ int get_window_size(int *rows, int *cols) {
 void init_editor() {
     E.cx = 0;
     E.cy = 0;
+    E.row_off = 0;
+    E.num_rows = 0;
+    E.row = NULL;
 
     if (get_window_size(&E.screen_rows, &E.screen_cols) == -1) {
         die("get_window_size");
     }
 }
 
+void editor_append_row(char *s, size_t n) {
+    E.row = realloc(E.row, sizeof(Row) * (E.num_rows + 1));
+    int at = E.num_rows;
+    E.row[at].size = n;
+    E.row[at].buf = malloc(n + 1);
+    memcpy(E.row[at].buf, s, n);
+    E.row[at].buf[n] = '\0';
+    E.num_rows++;
+}
+
 void editor_draw_rows(AppendBuffer *ab) {
     int y;
     for (y = 0; y < E.screen_rows; y++) {
-        if (y == E.screen_rows / 3) {
-            char welcome[80];
-            int n = snprintf(welcome, sizeof(welcome), "Kilo editor -- version %s", VERSION);
-            if (n > E.screen_cols) {
-                n = E.screen_cols;
-            }
-            // Add paddings
-            int padding = (E.screen_cols - n) / 2;
-            if (padding) {
+        int file_row = y + E.row_off;
+        if (file_row >= E.num_rows) {
+            if (E.num_rows == 0 && y == E.screen_rows / 3) {
+                char welcome[80];
+                int n = snprintf(welcome, sizeof(welcome), "Kilo editor -- version %s", VERSION);
+                if (n > E.screen_cols) {
+                    n = E.screen_cols;
+                }
+                // Add paddings
+                int padding = (E.screen_cols - n) / 2;
+                if (padding) {
+                    AppendBuffer_append(ab, "~", 1);
+                    padding--;
+                }
+                while (padding--) {
+                    AppendBuffer_append(ab, " ", 1);
+                }
+                AppendBuffer_append(ab, welcome, n);
+            } else {
                 AppendBuffer_append(ab, "~", 1);
-                padding--;
             }
-            while (padding--) {
-                AppendBuffer_append(ab, " ", 1);
-            }
-            AppendBuffer_append(ab, welcome, n);
         } else {
-            AppendBuffer_append(ab, "~", 1);
+            int n = E.row[file_row].size;
+            if (n > E.screen_cols) n = E.screen_cols;
+            AppendBuffer_append(ab, E.row[file_row].buf, n);
         }
         AppendBuffer_append(ab, "\x1b[K", 3);
 
@@ -159,24 +245,35 @@ void editor_draw_rows(AppendBuffer *ab) {
     }
 }
 
-void editor_move_cursor(char key) {
+void editor_scroll() {
+    if (E.cy < E.row_off) {
+        E.row_off = E.cy;
+    }
+    if (E.cy >= E.row_off + E.screen_rows) {
+        E.row_off = E.cy - E.screen_rows + 1;
+    }
+}
+
+void editor_move_cursor(int key) {
     switch (key) {
-        case 'a':
+        case ARROW_LEFT:
             if (E.cx > 0) E.cx--;
             break;
-        case 'd':
+        case ARROW_RIGHT:
             if (E.cx < E.screen_cols) E.cx++;
             break;
-        case 'w':
+        case ARROW_UP:
             if (E.cy > 0) E.cy--;
             break;
-        case 's':
-            if (E.cy < E.screen_rows) E.cy++;
+        case ARROW_DOWN:
+            if (E.cy < E.num_rows) E.cy++;
             break;
     }
 }
 
 void editor_refresh_screen() {
+    editor_scroll();
+
     AppendBuffer ab = AppendBuffer_INIT;
     // Hide cursor
     AppendBuffer_append(&ab, "\x1b[?25l", 6);
@@ -188,7 +285,7 @@ void editor_refresh_screen() {
     editor_draw_rows(&ab);
     // Move cursor to cx,cy
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy - E.row_off + 1, E.cx + 1);
     AppendBuffer_append(&ab, buf, strlen(buf));
     // AppendBuffer_append(&ab, "\x1b[H", 3);
     // Show cursor
@@ -198,7 +295,7 @@ void editor_refresh_screen() {
 }
 
 void editor_proc_keypress() {
-    char c = editor_read_key();
+    int c = editor_read_key();
     switch (c) {
         case CTRL_KEY('q'):
             // clear screen
@@ -207,18 +304,57 @@ void editor_proc_keypress() {
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
             break;
-        case 'w':
-        case 's':
-        case 'a':
-        case 'd':
+        case HOME_KEY:
+            E.cx = 0;
+            break;
+        case END_KEY:
+            E.cx = E.screen_cols - 1;
+            break;
+        case PAGE_UP:
+        case PAGE_DOWN:
+            {
+                int times = E.screen_rows;
+                while (times--) {
+                    editor_move_cursor(c == PAGE_UP? ARROW_UP: ARROW_DOWN);
+                }
+            }
+            break;
+        case ARROW_UP:
+        case ARROW_DOWN:
+        case ARROW_LEFT:
+        case ARROW_RIGHT:
             editor_move_cursor(c);
             break;
     }
 }
 
-int main() {
+void editor_open(char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        die("fopen");
+    }
+    
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    linelen = getline(&line, &linecap, fp);
+    while ((linelen = getline(&line, &linecap, fp)) != -1) {
+        if (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) {
+            linelen--;
+        }
+        editor_append_row(line, linelen);
+    }
+    free(line);
+    fclose(fp);
+}
+
+int main(int argc, char *argv[]) {
     enable_raw_mode();
     init_editor();
+    if (argc >= 2) {
+        editor_open(argv[1]);
+    }
+
     while (1) {
         editor_refresh_screen();
         editor_proc_keypress();
